@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  unit-and-build:
+    name: Unit, Vet, Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build server
+        run: go build ./cmd/server
+
+  compose-smoke:
+    name: Docker Compose smoke
+    runs-on: ubuntu-latest
+    needs: unit-and-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and start stack
+        run: docker compose up --build -d
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 60); do
+            code="$(curl -s -o /tmp/health.out -w '%{http_code}' http://localhost:8080/healthz || true)"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API did not become healthy in time"
+          exit 1
+
+      - name: Smoke endpoints
+        run: |
+          set -euo pipefail
+
+          status="$(curl -s -o /tmp/post_stocks.out -w '%{http_code}' -X POST http://localhost:8080/stocks -H 'content-type: application/json' -d '{"stocks":[{"name":"stock1","quantity":2}]}' )"
+          test "$status" = "200"
+
+          status="$(curl -s -o /tmp/buy.out -w '%{http_code}' -X POST http://localhost:8080/wallets/w1/stocks/stock1 -H 'content-type: application/json' -d '{"type":"buy"}' )"
+          test "$status" = "200"
+
+          wallet="$(curl -s http://localhost:8080/wallets/w1)"
+          echo "$wallet" | grep -q '"id":"w1"'
+          echo "$wallet" | grep -q '"stock1"'
+
+          qty="$(curl -s http://localhost:8080/wallets/w1/stocks/stock1)"
+          test "$qty" = "1"
+
+      - name: Chaos and HA check
+        run: |
+          set -euo pipefail
+
+          status="$(curl -s -D /tmp/chaos.hdr -o /tmp/chaos.out -w '%{http_code}' -X POST http://localhost:8080/chaos)"
+          test "$status" = "200"
+
+          sleep 2
+
+          ok=0
+          for i in $(seq 1 10); do
+            code="$(curl -s -o /tmp/ha.out -w '%{http_code}' http://localhost:8080/stocks || true)"
+            if [ "$code" = "200" ]; then
+              ok=$((ok + 1))
+            fi
+          done
+          test "$ok" -ge 9
+
+      - name: Dump compose status on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
